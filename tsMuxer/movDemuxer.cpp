@@ -333,18 +333,29 @@ class MovParsedH264TrackData : public ParsedTrackPrivData
     {
         const uint8_t* end = buff + size;
         unsigned nalCnt = 0;
-        while (buff < end)
-        {
-            if (buff + nal_length_size > end)
-                THROW(ERR_MOV_PARSE,
-                      "MP4/MOV error: Invalid H.264/AVC frame at position " << m_demuxer->getProcessedBytes())
-            const uint32_t nalSize = getNalSize(buff);
-            buff += nal_length_size;
-            if (buff + nalSize > end)
-                THROW(ERR_MOV_PARSE,
-                      "MP4/MOV error: Invalid H.264/AVC frame at position " << m_demuxer->getProcessedBytes())
-            buff += nalSize;
-            ++nalCnt;
+        try {
+            while (buff < end)
+            {
+                // 增加更多边界检查
+                if (end - buff < nal_length_size || buff + 4 > end)
+                    break;  // 不抛出异常，而是终止循环
+                    
+                const uint32_t nalSize = getNalSize(buff);
+                // 检查合理的NAL大小上限
+                if (nalSize > 10*1024*1024) // 10MB应该是合理上限
+                    break;
+                    
+                buff += nal_length_size;
+                if (buff + nalSize > end)
+                    break;  // 同样终止循环而非抛出异常
+                    
+                buff += nalSize;
+                ++nalCnt;
+            }
+        } catch (...) {
+            // 捕获任何异常
+            THROW(ERR_MOV_PARSE,
+                "MP4/MOV error: Invalid H.264/AVC frame at position " << m_demuxer->getProcessedBytes())
         }
         unsigned spsPpsSize = 0;
         for (auto& i : spsPpsList) spsPpsSize += static_cast<uint32_t>(i.size() + 4);
