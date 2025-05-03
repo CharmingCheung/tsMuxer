@@ -329,8 +329,7 @@ class MovParsedH264TrackData : public ParsedTrackPrivData
         }
     }
 
-    // 在 movDemuxer.cpp 中修改 MovParsedH264TrackData::newBufferSize 方法
-    unsigned MovParsedH264TrackData::newBufferSize(uint8_t* buff, const unsigned size) override
+    unsigned newBufferSize(uint8_t* buff, const unsigned size) override
     {
         // 基础检查
         if (buff == nullptr || size == 0) {
