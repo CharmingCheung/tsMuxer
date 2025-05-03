@@ -331,36 +331,71 @@ class MovParsedH264TrackData : public ParsedTrackPrivData
 
     unsigned newBufferSize(uint8_t* buff, const unsigned size) override
     {
+        // 首先进行输入验证
+        if (!buff || size == 0) {
+            return 0;  // 返回0表示无数据
+        }
+    
         const uint8_t* end = buff + size;
         unsigned nalCnt = 0;
-        try {
-            while (buff < end)
-            {
-                // 增加更多边界检查
-                if (end - buff < nal_length_size || buff + 4 > end)
-                    break;  // 不抛出异常，而是终止循环
-                    
-                const uint32_t nalSize = getNalSize(buff);
-                // 检查合理的NAL大小上限
-                if (nalSize > 10*1024*1024) // 10MB应该是合理上限
-                    break;
-                    
-                buff += nal_length_size;
-                if (buff + nalSize > end)
-                    break;  // 同样终止循环而非抛出异常
-                    
-                buff += nalSize;
-                ++nalCnt;
+        unsigned processedSize = 0;
+        
+        // 不使用try-catch，而是使用条件检查
+        while (buff < end && (end - buff) >= nal_length_size)
+        {
+            // 确保有足够的字节来读取NAL长度
+            uint32_t nalSize = 0;
+            
+            // 安全地获取NAL大小
+            if (nal_length_size == 1) {
+                nalSize = buff[0];
+            } else if (nal_length_size == 2 && (end - buff) >= 2) {
+                nalSize = (buff[0] << 8) + buff[1];
+            } else if (nal_length_size == 3 && (end - buff) >= 3) {
+                nalSize = (buff[0] << 16) + (buff[1] << 8) + buff[2];
+            } else if (nal_length_size == 4 && (end - buff) >= 4) {
+                nalSize = (buff[0] << 24) + (buff[1] << 16) + (buff[2] << 8) + buff[3];
+            } else {
+                // 缓冲区太小，无法读取NAL大小
+                break;
             }
-        } catch (...) {
-            // 捕获任何异常
-            THROW(ERR_MOV_PARSE,
-                "MP4/MOV error: Invalid H.264/AVC frame at position " << m_demuxer->getProcessedBytes())
+            
+            // 检查合理的NAL大小上限
+            if (nalSize > 10*1024*1024 || nalSize == 0) { // 10MB上限或0字节无效
+                break;
+            }
+            
+            buff += nal_length_size;
+            processedSize += nal_length_size;
+            
+            // 确保还有足够的数据供NAL使用
+            if (buff + nalSize > end) {
+                break;
+            }
+            
+            buff += nalSize;
+            processedSize += nalSize;
+            ++nalCnt;
         }
+        
+        // 只计算处理成功的部分
         unsigned spsPpsSize = 0;
-        for (auto& i : spsPpsList) spsPpsSize += static_cast<uint32_t>(i.size() + 4);
-
-        return size + spsPpsSize + nalCnt * (4 - nal_length_size);
+        // 确保spsPpsList可以安全访问
+        if (!spsPpsList.empty()) {
+            for (const auto& i : spsPpsList) {
+                if (i.size() <= INT_MAX - 4) {  // 防止整数溢出
+                    spsPpsSize += static_cast<uint32_t>(i.size() + 4);
+                }
+            }
+        }
+        
+        // 确保计算不会溢出
+        if (nalCnt <= (UINT_MAX - processedSize - spsPpsSize) / (4 - nal_length_size)) {
+            return processedSize + spsPpsSize + nalCnt * (4 - nal_length_size);
+        } else {
+            // 如果可能溢出，返回保守的估计
+            return size;
+        }
     }
 
    protected:
