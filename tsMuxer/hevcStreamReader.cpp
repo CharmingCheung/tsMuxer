@@ -463,103 +463,35 @@ void HEVCStreamReader::incTimings()
 
 int HEVCStreamReader::toFullPicOrder(const HevcSliceHeader* slice, const unsigned pic_bits)
 {
-    if (!slice) {
-        LTRACE(LT_WARN, 2, "Null slice in toFullPicOrder");
-        return 0;
+    if (slice->isIDR())
+    {
+        m_picOrderBase = m_frameNum;
+        m_picOrderMsb = 0;
+        m_prevPicOrder = 0;
+    }
+    else
+    {
+        const int range = 1 << pic_bits;
+
+        if (slice->pic_order_cnt_lsb < m_prevPicOrder && m_prevPicOrder - slice->pic_order_cnt_lsb >= range / 2)
+            m_picOrderMsb += range;
+        else if (slice->pic_order_cnt_lsb > m_prevPicOrder && slice->pic_order_cnt_lsb - m_prevPicOrder >= range / 2)
+            m_picOrderMsb -= range;
+
+        m_prevPicOrder = slice->pic_order_cnt_lsb;
     }
 
-    try {
-        if (slice->isIDR()) {
-            m_picOrderBase = m_frameNum;
-            m_picOrderMsb = 0;
-            m_prevPicOrder = 0;
-        }
-        else {
-            // 安全计算range，防止pic_bits过大导致溢出
-            int range = 1;
-            if (pic_bits < 31) { // 防止溢出
-                range = 1 << pic_bits;
-            }
-            else {
-                LTRACE(LT_WARN, 2, "pic_bits too large: " << pic_bits);
-                range = INT_MAX / 2; // 使用安全值
-            }
-
-            // 使用临时变量做判断，避免可能的溢出
-            const int diff = m_prevPicOrder - slice->pic_order_cnt_lsb;
-            const int halfRange = range / 2;
-            
-            if (diff > 0 && diff >= halfRange)
-                m_picOrderMsb += range;
-            else if (diff < 0 && -diff >= halfRange)
-                m_picOrderMsb -= range;
-
-            m_prevPicOrder = slice->pic_order_cnt_lsb;
-        }
-
-        const int64_t result = static_cast<int64_t>(slice->pic_order_cnt_lsb) + 
-                               static_cast<int64_t>(m_picOrderMsb) + 
-                               static_cast<int64_t>(m_picOrderBase);
-                               
-        // 确保结果在int范围内
-        if (result > INT_MAX || result < INT_MIN) {
-            LTRACE(LT_WARN, 2, "Picture order calculation overflow");
-            return 0;
-        }
-        
-        return static_cast<int>(result);
-    }
-    catch (const std::exception& e) {
-        LTRACE(LT_ERROR, 2, "Exception in toFullPicOrder: " << e.what());
-        return 0;
-    }
+    return slice->pic_order_cnt_lsb + m_picOrderMsb + m_picOrderBase;
 }
 
 void HEVCStreamReader::storeBuffer(MemoryBlock& dst, const uint8_t* data, const uint8_t* dataEnd)
 {
-    if (!data || !dataEnd || dataEnd <= data) {
-        LTRACE(LT_WARN, 2, "Invalid parameters in storeBuffer");
-        dst.clear();
-        return;
-    }
-    
-    try {
-        // 安全地将指针向后移动，跳过尾部的零字节
-        dataEnd--;
-        
-        // 最多向后查找32个字节，防止无限循环
-        const uint8_t* safeLimit = (dataEnd - data) > 32 ? dataEnd - 32 : data;
-        while (dataEnd > safeLimit && dataEnd[-1] == 0) {
-            dataEnd--;
-        }
-        
-        if (dataEnd > data) {
-            const size_t dataSize = static_cast<size_t>(dataEnd - data);
-            
-            // 检查数据大小的合理性
-            if (dataSize > 10 * 1024 * 1024) {  // 10MB是一个合理的上限
-                LTRACE(LT_WARN, 2, "Suspiciously large NAL unit: " << dataSize);
-                dst.clear();
-                return;
-            }
-            
-            try {
-                dst.resize(static_cast<int>(dataSize));
-                memcpy(dst.data(), data, dataSize);
-            }
-            catch (const std::exception& e) {
-                LTRACE(LT_ERROR, 2, "Exception in storeBuffer memory operations: " << e.what());
-                dst.clear();
-            }
-        }
-        else {
-            // 数据为空或无效
-            dst.clear();
-        }
-    }
-    catch (const std::exception& e) {
-        LTRACE(LT_ERROR, 2, "Exception in storeBuffer: " << e.what());
-        dst.clear();
+    dataEnd--;
+    while (dataEnd > data && dataEnd[-1] == 0) dataEnd--;
+    if (dataEnd > data)
+    {
+        dst.resize(static_cast<int>(dataEnd - data));
+        memcpy(dst.data(), data, dataEnd - data);
     }
 }
 
@@ -570,153 +502,107 @@ int HEVCStreamReader::intDecodeNAL(uint8_t* buff)
     m_spsPpsFound = false;
     m_lastIFrame = false;
 
-    if (!buff || buff >= m_bufEnd) {
-        LTRACE(LT_WARN, 2, "Invalid buffer in HEVC decode");
-        return NOT_ENOUGH_BUFFER;
-    }
-
     const uint8_t* prevPos = nullptr;
     uint8_t* curPos = buff;
-    
-    // 更健壮的NAL查找
-    uint8_t* nextNal = nullptr;
-    try {
-        nextNal = NALUnit::findNextNAL(curPos, m_bufEnd);
-    }
-    catch (const std::exception& e) {
-        LTRACE(LT_ERROR, 2, "Exception finding next NAL: " << e.what());
-        return NOT_ENOUGH_BUFFER;
-    }
+    uint8_t* nextNal = NALUnit::findNextNAL(curPos, m_bufEnd);
 
-    if (!m_eof && nextNal == m_bufEnd) {
+    if (!m_eof && nextNal == m_bufEnd)
         return NOT_ENOUGH_BUFFER;
-    }
 
-    while (curPos < m_bufEnd && curPos + 4 <= m_bufEnd) { // 确保至少有4字节可读取
-        try {
-            const auto nalType = static_cast<HevcUnit::NalType>((*curPos >> 1) & 0x3f);
-            
-            if (isSlice(nalType)) {
-                if (curPos + 3 <= m_bufEnd && (curPos[2] & 0x80)) { // 安全检查slice.first_slice
-                    if (sliceFound) {
-                        m_lastDecodedPos = prevPos;
-                        incTimings();
-                        return 0;
-                    }
-                    
-                    // 增强对MAX_SLICE_HEADER的边界检查
-                    const uint8_t* sliceHeaderEnd = FFMIN(curPos + MAX_SLICE_HEADER, nextNal);
-                    if (sliceHeaderEnd <= m_bufEnd) {
-                        m_slice->decodeBuffer(curPos, sliceHeaderEnd);
-                        rez = m_slice->deserialize(m_sps, m_pps);
-                        if (rez) {
-                            return rez;
-                        }
-                        if (nalType >= HevcUnit::NalType::BLA_W_LP)
-                            m_lastIFrame = true;
-                        m_fullPicOrder = toFullPicOrder(m_slice, m_sps->log2_max_pic_order_cnt_lsb);
-                    }
-                }
-                sliceFound = true;
-            }
-            else if (!isSuffix(nalType)) {
-                if (sliceFound) {
+    while (curPos < m_bufEnd)
+    {
+        const auto nalType = static_cast<HevcUnit::NalType>((*curPos >> 1) & 0x3f);
+        if (isSlice(nalType))
+        {
+            if (curPos[2] & 0x80)  // slice.first_slice
+            {
+                if (sliceFound)
+                {  // first slice of next frame: case where there is no non-VCL NAL between the two frames
+                    m_lastDecodedPos = prevPos;  // next frame started
                     incTimings();
-                    m_lastDecodedPos = prevPos;
                     return 0;
                 }
-
-                // 确保找到完整的NAL单元
-                if (nextNal <= m_bufEnd && nextNal >= curPos + 4) {
-                    uint8_t* nextNalWithStartCode = (nextNal >= curPos + 4 && nextNal[-4] == 0) ? 
-                                                    nextNal - 4 : 
-                                                    ((nextNal >= curPos + 3) ? nextNal - 3 : curPos);
-
-                    switch (nalType) {
-                    case HevcUnit::NalType::VPS:
-                        // 类似处理其他NAL类型...
-                        if (!m_vps)
-                            m_vps = new HevcVpsUnit();
-                        
-                        try {
-                            m_vps->decodeBuffer(curPos, nextNalWithStartCode);
-                            rez = m_vps->deserialize();
-                            if (rez)
-                                return rez;
-                            
-                            m_spsPpsFound = true;
-                            m_vpsCounter++;
-                            m_vpsSizeDiff = 0;
-                            
-                            if (m_vps->num_units_in_tick)
-                                updateFPS(m_vps, curPos, nextNalWithStartCode, 0);
-                                
-                            nextNal += m_vpsSizeDiff;
-                            storeBuffer(m_vpsBuffer, curPos, nextNalWithStartCode);
-                        }
-                        catch (const std::exception& e) {
-                            LTRACE(LT_ERROR, 2, "Exception in VPS parsing: " << e.what());
-                            // 尝试继续处理
-                        }
-                        break;
-                    
-                    // 其他case类似处理...
-                    // 对SPS, PPS等类型添加类似的try-catch块
-                    
-                    default:
-                        break;
-                    }
-                }
+                // first slice of current frame
+                m_slice->decodeBuffer(curPos, FFMIN(curPos + MAX_SLICE_HEADER, nextNal));
+                rez = m_slice->deserialize(m_sps, m_pps);
+                if (rez)
+                    return rez;  // not enough buffer or error
+                if (nalType >= HevcUnit::NalType::BLA_W_LP)
+                    m_lastIFrame = true;
+                m_fullPicOrder = toFullPicOrder(m_slice, m_sps->log2_max_pic_order_cnt_lsb);
             }
-            
-            prevPos = curPos;
-            curPos = nextNal;
-            
-            // 安全获取下一个NAL
-            if (curPos < m_bufEnd) {
-                try {
-                    nextNal = NALUnit::findNextNAL(curPos, m_bufEnd);
-                }
-                catch (const std::exception& e) {
-                    LTRACE(LT_ERROR, 2, "Exception finding next NAL: " << e.what());
-                    break;
-                }
-            }
-            else {
-                break;
-            }
-
-            if (!m_eof && nextNal == m_bufEnd)
-                return NOT_ENOUGH_BUFFER;
+            sliceFound = true;
         }
-        catch (const std::exception& e) {
-            LTRACE(LT_ERROR, 2, "Unexpected exception in NAL processing: " << e.what());
-            // 尝试推进到下一个NAL
-            prevPos = curPos;
-            if (nextNal > curPos)
-                curPos = nextNal;
-            else
-                curPos += 4; // 至少前进一点
-                
-            if (curPos < m_bufEnd) {
-                try {
-                    nextNal = NALUnit::findNextNAL(curPos, m_bufEnd);
-                }
-                catch (...) {
-                    break;
-                }
+        else if (!isSuffix(nalType))
+        {  // first non-VCL prefix NAL (AUD, SEI...) following current frame
+            if (sliceFound)
+            {
+                incTimings();
+                m_lastDecodedPos = prevPos;  // next frame started
+                return 0;
             }
-            else {
+
+            uint8_t* nextNalWithStartCode = nextNal[-4] == 0 ? nextNal - 4 : nextNal - 3;
+
+            switch (nalType)
+            {
+            case HevcUnit::NalType::VPS:
+                if (!m_vps)
+                    m_vps = new HevcVpsUnit();
+                m_vps->decodeBuffer(curPos, nextNalWithStartCode);
+                rez = m_vps->deserialize();
+                if (rez)
+                    return rez;
+                m_spsPpsFound = true;
+                m_vpsCounter++;
+                m_vpsSizeDiff = 0;
+                if (m_vps->num_units_in_tick)
+                    updateFPS(m_vps, curPos, nextNalWithStartCode, 0);
+                nextNal += m_vpsSizeDiff;
+                storeBuffer(m_vpsBuffer, curPos, nextNalWithStartCode);
+                break;
+            case HevcUnit::NalType::SPS:
+                if (!m_sps)
+                    m_sps = new HevcSpsUnit();
+                m_sps->decodeBuffer(curPos, nextNalWithStartCode);
+                rez = m_sps->deserialize();
+                if (rez)
+                    return rez;
+                m_spsPpsFound = true;
+                updateFPS(m_sps, curPos, nextNalWithStartCode, 0);
+                storeBuffer(m_spsBuffer, curPos, nextNalWithStartCode);
+                break;
+            case HevcUnit::NalType::PPS:
+                if (!m_pps)
+                    m_pps = new HevcPpsUnit();
+                m_pps->decodeBuffer(curPos, nextNalWithStartCode);
+                rez = m_pps->deserialize();
+                if (rez)
+                    return rez;
+                m_spsPpsFound = true;
+                storeBuffer(m_ppsBuffer, curPos, nextNalWithStartCode);
+                break;
+            case HevcUnit::NalType::SEI_PREFIX:
+                m_hdr->decodeBuffer(curPos, nextNal);
+                if (m_hdr->deserialize() != 0)
+                    return rez;
+                break;
+            default:
                 break;
             }
         }
+        prevPos = curPos;
+        curPos = nextNal;
+        nextNal = NALUnit::findNextNAL(curPos, m_bufEnd);
+
+        if (!m_eof && nextNal == m_bufEnd)
+            return NOT_ENOUGH_BUFFER;
     }
-    
-    if (m_eof) {
+    if (m_eof)
+    {
         m_lastDecodedPos = m_bufEnd;
         return 0;
     }
-    
     return NEED_MORE_DATA;
 }
 

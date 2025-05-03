@@ -58,73 +58,45 @@ uint8_t* NALUnit::addStartCode(uint8_t* buffer, const uint8_t* boundStart)
     return rez;
 }
 
-uint8_t* NALUnit::findNextNAL(uint8_t* buff, uint8_t* end)
+uint8_t* NALUnit::findNextNAL(uint8_t* buffer, uint8_t* end)
 {
-    if (!buff || buff >= end || end - buff < 4) {
-        LTRACE(LT_WARN, 2, "Invalid parameters in findNextNAL");
-        return end; // 返回缓冲区末尾作为未找到标记
-    }
-    
-    try {
-        // 跳过当前NAL的开始码
-        if (buff[0] == 0 && buff[1] == 0 && buff[2] == 1)
-            buff += 3;
-        else if (buff[0] == 0 && buff[1] == 0 && buff[2] == 0 && buff[3] == 1)
-            buff += 4;
-        
-        // 寻找下一个开始码
-        while (buff + 3 < end) {
-            // 3字节开始码: 0 0 1
-            if (buff[0] == 0 && buff[1] == 0 && buff[2] == 1)
-                return buff;
-            
-            // 4字节开始码: 0 0 0 1
-            if (buff[0] == 0 && buff[1] == 0 && buff[2] == 0 && buff + 3 < end && buff[3] == 1)
-                return buff;
-                
-            buff++;
+    for (buffer += 2; buffer < end;)
+    {
+        if (*buffer > 1)
+            buffer += 3;
+        else if (*buffer == 0)
+            buffer++;
+        else  // *buffer == 1
+        {
+            if (buffer[-2] == 0 && buffer[-1] == 0)
+                return buffer + 1;
+            buffer += 3;
         }
-        
-        return end; // 找不到下一个NAL
     }
-    catch (const std::exception& e) {
-        LTRACE(LT_ERROR, 2, "Exception in findNextNAL: " << e.what());
-        return end;
-    }
+    return end;
 }
 
-uint8_t* NALUnit::findNALWithStartCode(uint8_t* buff, uint8_t* end, bool includeStartCode)
+uint8_t* NALUnit::findNALWithStartCode(uint8_t* buffer, uint8_t* end, const bool longCodesAllowed)
 {
-    if (!buff || buff >= end || end - buff < 4) {
-        LTRACE(LT_WARN, 2, "Invalid parameters in findNALWithStartCode");
-        return end;
+    const uint8_t* bufStart = buffer;
+    for (buffer += 2; buffer < end;)
+    {
+        if (*buffer > 1)
+            buffer += 3;
+        else if (*buffer == 0)
+            buffer++;
+        else  // *buffer == 1
+        {
+            if (buffer[-2] == 0 && buffer[-1] == 0)
+            {
+                if (longCodesAllowed && buffer - 3 >= bufStart && buffer[-3] == 0)
+                    return buffer - 3;
+                return buffer - 2;
+            }
+            buffer += 3;
+        }
     }
-    
-    try {
-        uint8_t* nextNAL = findNextNAL(buff, end);
-        
-        // 如果找不到下一个NAL，返回缓冲区末尾
-        if (nextNAL == end)
-            return end;
-        
-        // 根据需要包含或排除NAL开始码
-        if (includeStartCode)
-            return nextNAL;
-        
-        // 跳过开始码
-        if (nextNAL + 2 < end && nextNAL[0] == 0 && nextNAL[1] == 0 && nextNAL[2] == 1)
-            return nextNAL + 3;
-        else if (nextNAL + 3 < end && nextNAL[0] == 0 && nextNAL[1] == 0 && nextNAL[2] == 0 && nextNAL[3] == 1)
-            return nextNAL + 4;
-            
-        // 异常情况处理
-        LTRACE(LT_WARN, 2, "Inconsistent NAL start code");
-            return nextNAL;
-        }
-        catch (const std::exception& e) {
-            LTRACE(LT_ERROR, 2, "Exception in findNALWithStartCode: " << e.what());
-            return end;
-        }
+    return end;
 }
 
 int NALUnit::encodeNAL(const uint8_t* srcBuffer, const uint8_t* srcEnd, uint8_t* dstBuffer, size_t dstBufferSize)

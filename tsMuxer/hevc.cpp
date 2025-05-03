@@ -19,96 +19,21 @@ unsigned ceilDiv(const unsigned a, const unsigned b) { return (a / b) + ((a % b)
 
 unsigned HevcUnit::extractUEGolombCode()
 {
-    try {
-        unsigned cnt = 0;
-        
-        // 计算前导0的数量
-        while (m_reader.getBitsLeft() > 0 && !m_reader.getBit()) {
-            cnt++;
-            
-            // 防止无限循环或超大值
-            if (cnt >= 32) {
-                LTRACE(LT_WARN, 2, "UE Golomb code too long (>32 bits)");
-                return UINT32_MAX;
-            }
-        }
-        // 如果没有足够的位来读取整个码字
-        if (m_reader.getBitsLeft() < cnt) {
-            LTRACE(LT_WARN, 2, "Not enough bits left to read UE Golomb value");
-            return UINT32_MAX;
-        }
-        
-        // 计算值：2^cnt - 1 + info位的值
-        uint64_t value = (1ULL << cnt) - 1;
-        
-        for (unsigned i = 0; i < cnt; i++) {
-            value += (m_reader.getBit() ? 1ULL : 0ULL) << (cnt - i - 1);
-        }
-        
-        // 检查溢出
-        if (value > UINT32_MAX) {
-            LTRACE(LT_WARN, 2, "UE Golomb value exceeds UINT32_MAX");
-            return UINT32_MAX;
-        }
-        
-        return static_cast<unsigned>(value);
-    }
-    catch (BitStreamException& e) {
-        LTRACE(LT_ERROR, 2, "BitStream exception in extractUEGolombCode: " << e.what());
-        throw;  // 重新抛出异常让调用者处理
-    }
-    catch (const std::exception& e) {
-        LTRACE(LT_ERROR, 2, "Exception in extractUEGolombCode: " << e.what());
-        throw;  // 重新抛出异常让调用者处理
-    }
+    unsigned cnt = 0;
+    for (; !m_reader.getBit(); cnt++)
+        ;
+    if (cnt > INT_BIT)
+        THROW_BITSTREAM_ERR;
+    return (1 << cnt) - 1 + m_reader.getBits(cnt);
 }
 
 int HevcUnit::extractSEGolombCode()
 {
-    try {
-        const unsigned rez = extractUEGolombCode();
-        
-        // 检查溢出或无效值
-        if (rez == UINT32_MAX) {
-            return INT_MAX;  // 表示错误
-        }
-        
-        // 根据SE Golomb编码规则计算有符号值
-        if (rez % 2 == 0) {
-            // 偶数编码负值
-            const int64_t signedValue = -(static_cast<int64_t>(rez) / 2);
-            
-            // 检查溢出
-            if (signedValue < INT_MIN) {
-                LTRACE(LT_WARN, 2, "SE Golomb value underflow");
-                return INT_MIN;
-            }
-            
-            return static_cast<int>(signedValue);
-        }
-        else {
-            // 奇数编码正值
-            const int64_t signedValue = (static_cast<int64_t>(rez) + 1) / 2;
-            
-            // 检查溢出
-            if (signedValue > INT_MAX) {
-                LTRACE(LT_WARN, 2, "SE Golomb value overflow");
-                return INT_MAX;
-            }
-            
-            return static_cast<int>(signedValue);
-        }
-    }
-    catch (BitStreamException& e) {
-        LTRACE(LT_ERROR, 2, "BitStream exception in extractSEGolombCode: " << e.what());
-        return INT_MAX;  // 返回错误值
-    }
-    catch (const std::exception& e) {
-        LTRACE(LT_ERROR, 2, "Exception in extractSEGolombCode: " << e.what());
-        return INT_MAX;  // 返回错误值
-    }
+    const unsigned rez = extractUEGolombCode();
+    if (rez % 2 == 0)
+        return -static_cast<int>(rez / 2);
+    return static_cast<int>((rez + 1) / 2);
 }
-
 
 void HevcUnit::decodeBuffer(const uint8_t* buffer, const uint8_t* end)
 {
@@ -119,100 +44,49 @@ void HevcUnit::decodeBuffer(const uint8_t* buffer, const uint8_t* end)
 
 int HevcUnit::deserialize()
 {
-    if (m_nalBuffer == nullptr || m_nalBufferLen == 0) {
-        LTRACE(LT_WARN, 2, "Empty NAL buffer in HEVC deserialize");
-        return NOT_ENOUGH_BUFFER;
-    }
-    
-    try {
-        m_reader.setBuffer(m_nalBuffer, m_nalBuffer + m_nalBufferLen);
-        
-        if (m_reader.getBitsLeft() < 16) { // 确保至少有足够的位可读
-            LTRACE(LT_WARN, 2, "NAL buffer too small for header");
-            return NOT_ENOUGH_BUFFER;
-        }
-        
+    m_reader.setBuffer(m_nalBuffer, m_nalBuffer + m_nalBufferLen);
+    try
+    {
         m_reader.skipBit();
         nal_unit_type = static_cast<NalType>(m_reader.getBits(6));
         nuh_layer_id = m_reader.getBits<uint8_t>(6);
         nuh_temporal_id_plus1 = m_reader.getBits<uint8_t>(3);
-        
         if (nuh_temporal_id_plus1 == 0 ||
             (nuh_temporal_id_plus1 != 1 && (nal_unit_type == NalType::VPS || nal_unit_type == NalType::SPS ||
-                                          nal_unit_type == NalType::EOS || nal_unit_type == NalType::EOB)))
+                                            nal_unit_type == NalType::EOS || nal_unit_type == NalType::EOB)))
             return 1;
         return 0;
     }
-    catch (BitStreamException& e) {
-        LTRACE(LT_ERROR, 2, "BitStream exception in HEVC deserialize: " << e.what());
-        return NOT_ENOUGH_BUFFER;
-    }
-    catch (const std::exception& e) {
-        LTRACE(LT_ERROR, 2, "Exception in HEVC deserialize: " << e.what());
+    catch (BitStreamException& e)
+    {
+        (void)e;
         return NOT_ENOUGH_BUFFER;
     }
 }
 
 void HevcUnit::updateBits(const int bitOffset, const int bitLen, const unsigned value) const
 {
-    if (bitOffset < 0 || bitLen <= 0) {
-        LTRACE(LT_WARN, 2, "Invalid parameters in updateBits");
-        return;
+    uint8_t* ptr = m_reader.getBuffer() + bitOffset / 8;
+    BitStreamWriter bitWriter{};
+    const int byteOffset = bitOffset % 8;
+    bitWriter.setBuffer(ptr, ptr + (bitLen / 8 + 5));
+
+    const uint8_t* ptr_end = m_reader.getBuffer() + (bitOffset + bitLen) / 8;
+    const int endBitsPostfix = 8 - ((bitOffset + bitLen) % 8);
+
+    if (byteOffset > 0)
+    {
+        const int prefix = *ptr >> (8 - byteOffset);
+        bitWriter.putBits(byteOffset, prefix);
     }
-    
-    try {
-        uint8_t* ptr = m_reader.getBuffer();
-        if (!ptr) {
-            LTRACE(LT_WARN, 2, "Null buffer in updateBits");
-            return;
-        }
-        
-        // 计算字节偏移和位偏移
-        ptr += bitOffset / 8;
-        const int byteOffset = bitOffset % 8;
-        
-        BitStreamWriter bitWriter{};
-        
-        // 确保有足够的缓冲区
-        const uint8_t* bufferEnd = m_reader.getBufferEnd();
-        if (!bufferEnd || ptr + (bitLen / 8 + 5) > bufferEnd) {
-            LTRACE(LT_WARN, 2, "Buffer too small in updateBits");
-            return;
-        }
-        
-        bitWriter.setBuffer(ptr, ptr + (bitLen / 8 + 5));
-        
-        const uint8_t* ptr_end = m_reader.getBuffer() + (bitOffset + bitLen) / 8;
-        if (ptr_end >= bufferEnd) {
-            LTRACE(LT_WARN, 2, "End position beyond buffer in updateBits");
-            return;
-        }
-        
-        const int endBitsPostfix = 8 - ((bitOffset + bitLen) % 8);
-        
-        // 保留前缀位
-        if (byteOffset > 0) {
-            const int prefix = *ptr >> (8 - byteOffset);
-            bitWriter.putBits(byteOffset, prefix);
-        }
-        
-        // 写入新值
-        bitWriter.putBits(bitLen, value);
-        
-        // 保留后缀位
-        if (endBitsPostfix < 8) {
-            const int postfix = *ptr_end & ((1 << endBitsPostfix) - 1);
-            bitWriter.putBits(endBitsPostfix, postfix);
-        }
-        
-        bitWriter.flushBits();
+    bitWriter.putBits(bitLen, value);
+
+    if (endBitsPostfix < 8)
+    {
+        const int postfix = *ptr_end & (1 << endBitsPostfix) - 1;
+        bitWriter.putBits(endBitsPostfix, postfix);
     }
-    catch (BitStreamException& e) {
-        LTRACE(LT_ERROR, 2, "BitStream exception in updateBits: " << e.what());
-    }
-    catch (const std::exception& e) {
-        LTRACE(LT_ERROR, 2, "Exception in updateBits: " << e.what());
-    }
+    bitWriter.flushBits();
 }
 
 int HevcUnit::serializeBuffer(uint8_t* dstBuffer, const uint8_t* dstEnd) const
@@ -637,78 +511,139 @@ int HevcSpsUnit::deserialize()
     const int rez = HevcUnit::deserialize();
     if (rez)
         return rez;
-        
-    try {
+    try
+    {
         vps_id = m_reader.getBits<uint8_t>(4);
         max_sub_layers = m_reader.getBits<uint8_t>(3) + 1;
-        
-        // 增加范围检查
-        if (max_sub_layers > 7) {
-            LTRACE(LT_WARN, 2, "Invalid max_sub_layers value: " << max_sub_layers);
+        if (max_sub_layers > 7)
             return 1;
-        }
-        
         m_reader.skipBit();  // temporal_id_nesting_flag
-        
-        // 增加错误处理
-        if (profile_tier_level(max_sub_layers) != 0) {
-            LTRACE(LT_WARN, 2, "Error parsing profile_tier_level");
+        if (profile_tier_level(max_sub_layers) != 0)
             return 1;
-        }
-        
         sps_id = extractUEGolombCode();
-        if (sps_id > 15) {
-            LTRACE(LT_WARN, 2, "Invalid SPS ID: " << sps_id);
+        if (sps_id > 15)
             return 1;
-        }
-        
         chromaFormat = extractUEGolombCode();
-        if (chromaFormat > 3) {
-            LTRACE(LT_WARN, 2, "Invalid chroma format: " << chromaFormat);
+        if (chromaFormat > 3)
             return 1;
-        }
-        
         if (chromaFormat == 3)
             separate_colour_plane_flag = m_reader.getBit();
-            
         pic_width_in_luma_samples = extractUEGolombCode();
-        if (pic_width_in_luma_samples == 0 || pic_width_in_luma_samples > 8192) { // 合理的上限
-            LTRACE(LT_WARN, 2, "Invalid picture width: " << pic_width_in_luma_samples);
+        if (pic_width_in_luma_samples == 0)
             return 1;
-        }
-        
         pic_height_in_luma_samples = extractUEGolombCode();
-        if (pic_height_in_luma_samples == 0 || pic_height_in_luma_samples > 4320) { // 合理的上限
-            LTRACE(LT_WARN, 2, "Invalid picture height: " << pic_height_in_luma_samples);
+        if (pic_height_in_luma_samples == 0)
             return 1;
-        }
-        
-        // 标记4K内容
         if (pic_width_in_luma_samples >= 3840)
             V3_flags |= FOUR_K;
 
-        // ... 剩余代码 ...
-
-        // 确保所有需要的变量都已正确初始化
-        if (log2_max_pic_order_cnt_lsb == 0) {
-            LTRACE(LT_WARN, 2, "Invalid log2_max_pic_order_cnt_lsb");
-            return 1;
+        if (m_reader.getBit())  // conformance_window_flag
+        {
+            extractUEGolombCode();  // conf_win_left_offset ue(v)
+            extractUEGolombCode();  // conf_win_right_offset ue(v)
+            extractUEGolombCode();  // conf_win_top_offset ue(v)
+            extractUEGolombCode();  // conf_win_bottom_offset ue(v)
         }
-        
-        // 安全检查PicSizeInCtbsY_bits
-        if (PicSizeInCtbsY_bits == 0 || PicSizeInCtbsY_bits > 32) {
-            LTRACE(LT_WARN, 2, "Invalid PicSizeInCtbsY_bits: " << PicSizeInCtbsY_bits);
-            PicSizeInCtbsY_bits = 16; // 使用合理的默认值
+
+        bit_depth_luma_minus8 = extractUEGolombCode();
+        if (bit_depth_luma_minus8 > 8)
+            return 1;
+        bit_depth_chroma_minus8 = extractUEGolombCode();
+        if (bit_depth_chroma_minus8 > 8)
+            return 1;
+        log2_max_pic_order_cnt_lsb = extractUEGolombCode() + 4;
+        if (log2_max_pic_order_cnt_lsb > 16)
+            return 1;
+        const bool sps_sub_layer_ordering_info_present_flag = m_reader.getBit();
+        for (int i = (sps_sub_layer_ordering_info_present_flag ? 0 : max_sub_layers - 1); i <= max_sub_layers - 1; i++)
+        {
+            const unsigned sps_max_dec_pic_buffering_minus1 = extractUEGolombCode();
+            const unsigned sps_max_num_reorder_pics = extractUEGolombCode();
+            if (sps_max_num_reorder_pics > sps_max_dec_pic_buffering_minus1)
+                return 1;
+            const unsigned sps_max_latency_increase_plus1 = extractUEGolombCode();
+            if (sps_max_latency_increase_plus1 == UINT_MAX)
+                return 1;
+        }
+
+        const unsigned log2_min_luma_coding_block_size_minus3 = extractUEGolombCode();
+        const unsigned log2_diff_max_min_luma_coding_block_size = extractUEGolombCode();
+        extractUEGolombCode();  // log2_min_luma_transform_block_size_minus2 ue(v)
+        extractUEGolombCode();  // log2_diff_max_min_luma_transform_block_size ue(v)
+        extractUEGolombCode();  // max_transform_hierarchy_depth_inter ue(v)
+        extractUEGolombCode();  // max_transform_hierarchy_depth_intra ue(v)
+
+        const unsigned MinCbLog2SizeY = log2_min_luma_coding_block_size_minus3 + 3;
+        const unsigned CtbLog2SizeY = MinCbLog2SizeY + log2_diff_max_min_luma_coding_block_size;
+        const unsigned CtbSizeY = 1 << CtbLog2SizeY;
+        const unsigned PicWidthInCtbsY = ceilDiv(pic_width_in_luma_samples, CtbSizeY);
+        const unsigned PicHeightInCtbsY = ceilDiv(pic_height_in_luma_samples, CtbSizeY);
+        unsigned PicSizeInCtbsY = PicWidthInCtbsY * PicHeightInCtbsY;
+        PicSizeInCtbsY_bits = 0;
+        unsigned count1bits = 0;
+
+        // Ceil( Log2( PicSizeInCtbsY ))
+        while (PicSizeInCtbsY)
+        {
+            count1bits += PicSizeInCtbsY & 1;
+            PicSizeInCtbsY_bits++;
+            PicSizeInCtbsY >>= 1;
+        }
+        if (count1bits == 1)
+            PicSizeInCtbsY_bits -= 1;  // in case PicSizeInCtbsY is power of 2
+
+        if (m_reader.getBit())  // scaling_list_enabled_flag
+        {
+            if (m_reader.getBit())  // sps_scaling_list_data_present_flag
+            {
+                if (scaling_list_data())
+                    return 1;
+            }
+        }
+
+        m_reader.skipBits(2);   // amp_enabled_flag, sample_adaptive_offset_enabled_flag
+        if (m_reader.getBit())  // pcm_enabled_flag
+        {
+            m_reader.skipBits(8);           // pcm_sample_bit_depth_luma_minus1, pcm_sample_bit_depth_chroma_minus1
+            if (extractUEGolombCode() > 2)  // log2_min_pcm_luma_coding_block_size_minus3
+                return 1;
+            if (extractUEGolombCode() > 2)  // log2_diff_max_min_pcm_luma_coding_block_size
+                return 1;
+            m_reader.skipBit();  // m_rpcm_loop_filter_disabled_flag
+        }
+        num_short_term_ref_pic_sets = extractUEGolombCode();
+        if (num_short_term_ref_pic_sets > 64)
+            return 1;
+
+        num_delta_pocs.resize(num_short_term_ref_pic_sets);
+
+        for (unsigned i = 0; i < num_short_term_ref_pic_sets; i++)
+        {
+            if (short_term_ref_pic_set(i) != 0)
+                return 1;
+        }
+        if (m_reader.getBit())  // long_term_ref_pics_present_flag
+        {
+            const unsigned num_long_term_ref_pics_sps = extractUEGolombCode();
+            if (num_long_term_ref_pics_sps > 32)
+                return 1;
+            for (unsigned i = 0; i < num_long_term_ref_pics_sps; i++)
+            {
+                m_reader.skipBits(log2_max_pic_order_cnt_lsb + 1);  // lt_ref_pic_poc_lsb_sps[i]
+            }
+        }
+        m_reader.skipBits(2);   // sps_temporal_mvp_enabled_flag, strong_intra_smoothing_enabled_flag
+        if (m_reader.getBit())  // vui_parameters_present_flag
+        {
+            if (vui_parameters())
+                return 1;
         }
 
         return 0;
     }
-    catch (VodCoreException& e) {
-        LTRACE(LT_ERROR, 2, "VodCore exception in SPS deserialize: " << e.what());
-        return NOT_ENOUGH_BUFFER;
-    }
-    catch (const std::exception& e) {
-        LTRACE(LT_ERROR, 2, "Exception in SPS deserialize: " << e.what());
+    catch (VodCoreException& e)
+    {
+        (void)e;
         return NOT_ENOUGH_BUFFER;
     }
 }
@@ -856,80 +791,51 @@ HevcSliceHeader::HevcSliceHeader() : first_slice(false), pps_id(-1), slice_type(
 
 int HevcSliceHeader::deserialize(const HevcSpsUnit* sps, const HevcPpsUnit* pps)
 {
-    if (!sps || !pps) {
-        LTRACE(LT_WARN, 2, "Null SPS or PPS in slice header deserialize");
-        return 1;
-    }
-    
     const int rez = HevcUnit::deserialize();
     if (rez)
         return rez;
 
-    try {
+    try
+    {
         pic_order_cnt_lsb = 0;
         first_slice = m_reader.getBit();
-        
         if (nal_unit_type >= NalType::BLA_W_LP && nal_unit_type <= NalType::RSV_IRAP_VCL23)
             m_reader.skipBit();  // no_output_of_prior_pics_flag u(1)
-            
         pps_id = extractUEGolombCode();
-        if (pps_id > 63) {
-            LTRACE(LT_WARN, 2, "Invalid PPS ID in slice header: " << pps_id);
+        if (pps_id > 63)
             return 1;
-        }
-        
         bool dependent_slice_segment_flag = false;
-        if (!first_slice) {
+        if (!first_slice)
+        {
             if (pps->dependent_slice_segments_enabled_flag)
                 dependent_slice_segment_flag = m_reader.getBit();
-                
-            // 增强边界检查
-            if (sps->PicSizeInCtbsY_bits > 0 && sps->PicSizeInCtbsY_bits <= 32) {
-                m_reader.skipBits(sps->PicSizeInCtbsY_bits);  // slice_segment_address
-            } else {
-                LTRACE(LT_WARN, 2, "Invalid PicSizeInCtbsY_bits value: " << sps->PicSizeInCtbsY_bits);
-                return 1;
-            }
+            m_reader.skipBits(sps->PicSizeInCtbsY_bits);  // slice_segment_address
         }
-        
-        if (!dependent_slice_segment_flag) {
+        if (!dependent_slice_segment_flag)
+        {
             for (int i = 0; i < pps->num_extra_slice_header_bits; i++)
                 m_reader.skipBit();  // slice_reserved_flag[ i ] u(1)
-                
             slice_type = extractUEGolombCode();
-            if (slice_type > 2) {
-                LTRACE(LT_WARN, 2, "Invalid slice type: " << slice_type);
+            if (slice_type > 2)
                 return 1;
-            }
-            
             if (pps->output_flag_present_flag)
                 m_reader.skipBit();  // pic_output_flag u(1)
-                
-            if (sps->separate_colour_plane_flag == 1) {
-                const auto colourPlaneId = m_reader.getBits(2);
-                if (colourPlaneId > 2) {
-                    LTRACE(LT_WARN, 2, "Invalid colour_plane_id: " << colourPlaneId);
+            if (sps->separate_colour_plane_flag == 1)
+            {
+                if (m_reader.getBits(2) > 2)  // colour_plane_id
                     return 1;
-                }
             }
-            
-            // 安全读取pic_order_cnt_lsb
-            if (!isIDR() && sps->log2_max_pic_order_cnt_lsb > 0 && sps->log2_max_pic_order_cnt_lsb <= 16) {
+            if (!isIDR())
+            {
                 pic_order_cnt_lsb = m_reader.getBits<uint16_t>(sps->log2_max_pic_order_cnt_lsb);
-            } else if (!isIDR()) {
-                LTRACE(LT_WARN, 2, "Invalid log2_max_pic_order_cnt_lsb: " << sps->log2_max_pic_order_cnt_lsb);
-                return 1;
             }
         }
 
         return 0;
     }
-    catch (VodCoreException& e) {
-        LTRACE(LT_ERROR, 2, "VodCore exception in slice header deserialize: " << e.what());
-        return NOT_ENOUGH_BUFFER;
-    }
-    catch (const std::exception& e) {
-        LTRACE(LT_ERROR, 2, "Exception in slice header deserialize: " << e.what());
+    catch (VodCoreException& e)
+    {
+        (void)e;
         return NOT_ENOUGH_BUFFER;
     }
 }
@@ -942,66 +848,39 @@ bool HevcSliceHeader::isIDR() const
 vector<vector<uint8_t>> hevc_extract_priv_data(const uint8_t* buff, int size, uint8_t* nal_size)
 {
     *nal_size = 4;
+
     vector<vector<uint8_t>> spsPps;
-    
-    // 增强边界检查
-    if (size < 23) {
-        LTRACE(LT_WARN, 2, "HEVC extra data too short, size: " << size);
+    if (size < 23)
         return spsPps;
-    }
 
-    try {
-        *nal_size = (buff[21] & 3) + 1;
-        int num_arrays = buff[22];
+    *nal_size = (buff[21] & 3) + 1;
+    int num_arrays = buff[22];
 
-        const uint8_t* src = buff + 23;
-        const uint8_t* end = buff + size;
-        
-        for (int i = 0; i < num_arrays && src + 3 <= end; ++i) {
-            uint8_t nal_type = *src++;
-            
-            // 采用更安全的读取方式
-            int cnt = 0; 
-            if (src + 2 <= end) {
-                cnt = (src[0] << 8) | src[1];
-                src += 2;
-            } else {
-                LTRACE(LT_WARN, 2, "Buffer overrun in HEVC param parsing");
-                break;
-            }
+    const uint8_t* src = buff + 23;
+    const uint8_t* end = buff + size;
+    for (int i = 0; i < num_arrays; ++i)
+    {
+        if (src + 3 > end)
+            THROW(ERR_MOV_PARSE, "Invalid HEVC extra data format")
+        src++;  // type
+        int cnt = AV_RB16(src);
+        src += 2;
 
-            for (int j = 0; j < cnt && src < end; ++j) {
-                int nalSize = 0;
-                if (src + 2 <= end) {
-                    nalSize = (src[0] << 8) | src[1];
-                    src += 2;
-                } else {
-                    LTRACE(LT_WARN, 2, "Buffer overrun in HEVC NAL size reading");
-                    break;
-                }
-                
-                if (nalSize > 0) {
-                    if (src + nalSize <= end) {
-                        spsPps.emplace_back();
-                        auto& nal = spsPps.back();
-                        nal.reserve(nalSize); // 预分配内存以避免多次重分配
-                        for (int k = 0; k < nalSize; ++k) {
-                            nal.push_back(src[k]);
-                        }
-                        src += nalSize;
-                    } else {
-                        LTRACE(LT_WARN, 2, "NAL size exceeds buffer bounds");
-                        break;
-                    }
-                }
+        for (int j = 0; j < cnt; ++j)
+        {
+            if (src + 2 > end)
+                THROW(ERR_MOV_PARSE, "Invalid HEVC extra data format")
+            int nalSize = (src[0] << 8) + src[1];
+            src += 2;
+            if (src + nalSize > end)
+                THROW(ERR_MOV_PARSE, "Invalid HEVC extra data format")
+            if (nalSize > 0)
+            {
+                spsPps.emplace_back();
+                for (int k = 0; k < nalSize; ++k, ++src) spsPps.rbegin()->push_back(*src);
             }
         }
-        
-        return spsPps;
     }
-    catch (const std::exception& e) {
-        LTRACE(LT_ERROR, 2, "Exception in HEVC param extraction: " << e.what());
-        spsPps.clear();
-        return spsPps;
-    }
+
+    return spsPps;
 }
