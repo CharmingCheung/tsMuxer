@@ -283,7 +283,7 @@ class MovParsedH264TrackData : public ParsedTrackPrivData
         }
     }
 
-    getNalSize(const uint8_t* buff) const
+    int getNalSize(const uint8_t* buff) const
     {
         // 增加防御性检查
         if (!buff) {
