@@ -283,18 +283,43 @@ class MovParsedH264TrackData : public ParsedTrackPrivData
         }
     }
 
-    int getNalSize(const uint8_t* buff) const
+    getNalSize(const uint8_t* buff) const
     {
-        if (nal_length_size == 1)
-            return buff[0];
-        if (nal_length_size == 2)
-            return (buff[0] << 8) + buff[1];
-        if (nal_length_size == 3)
-            return (buff[0] << 16) + (buff[1] << 8) + buff[2];
-        if (nal_length_size == 4)
-            return (buff[0] << 24) + (buff[1] << 16) + (buff[2] << 8) + buff[3];
-
-        THROW(ERR_MOV_PARSE, "MP4/MOV error: Unsupported H.264/AVC frame length field value " << nal_length_size)
+        // 增加防御性检查
+        if (!buff) {
+            LTRACE(LT_ERROR, 2, "Null buffer in getNalSize");
+            return 0;
+        }
+        
+        try {
+            // 原始获取NAL大小的逻辑
+            uint32_t result = 0;
+            
+            if (nal_length_size == 1)
+                result = buff[0];
+            else if (nal_length_size == 2)
+                result = (buff[0] << 8) + buff[1];
+            else if (nal_length_size == 3)
+                result = (buff[0] << 16) + (buff[1] << 8) + buff[2];
+            else if (nal_length_size == 4)
+                result = (buff[0] << 24) + (buff[1] << 16) + (buff[2] << 8) + buff[3];
+            else {
+                LTRACE(LT_ERROR, 2, "MP4/MOV error: Unsupported H.264/AVC frame length field value " << nal_length_size);
+                return 0;
+            }
+            
+            // 检查结果的合理性
+            if (result > 10*1024*1024) { // 10MB是很大的上限了
+                LTRACE(LT_ERROR, 2, "Unreasonably large NAL size detected: " << result << ", using safe value");
+                return 0; // 返回安全值
+            }
+            
+            return result;
+        }
+        catch (...) {
+            LTRACE(LT_ERROR, 2, "Exception in getNalSize");
+            return 0;
+        }
     }
 
     void extractData(AVPacket* pkt, uint8_t* buff, const int size) override
@@ -329,9 +354,8 @@ class MovParsedH264TrackData : public ParsedTrackPrivData
         }
     }
 
-    unsigned newBufferSize(uint8_t* buff, const unsigned size) override
+    unsigned newBufferSize(uint8_t* buff, const unsigned size)
     {
-        // 基础检查
         if (buff == nullptr || size == 0) {
             LTRACE(LT_WARN, 2, "Empty buffer in H.264 newBufferSize");
             return 0;
@@ -347,15 +371,15 @@ class MovParsedH264TrackData : public ParsedTrackPrivData
                 // 确保有足够的字节读取NAL长度
                 if (buff + nal_length_size > end) {
                     LTRACE(LT_WARN, 2, "Invalid H.264/AVC frame at position " << m_demuxer->getProcessedBytes()
-                                    << " (buffer overrun reading length)");
-                    return size; // 返回原始大小，避免解析错误
+                                      << " (buffer overrun reading length)");
+                    return size; // 返回原始大小
                 }
                 
-                // 获取NAL单元大小，添加上限检查
+                // 获取NAL单元大小
                 const uint32_t nalSize = getNalSize(buff);
-                if (nalSize > 10*1024*1024) { // 10MB是非常大的上限
-                    LTRACE(LT_WARN, 2, "Suspiciously large NAL size: " << nalSize);
-                    return size; // 返回原始大小，避免解析错误
+                if (nalSize == 0) {
+                    LTRACE(LT_WARN, 2, "Zero NAL size detected, stopping parsing");
+                    return size; // 安全返回原始大小
                 }
                 
                 buff += nal_length_size;
@@ -363,8 +387,8 @@ class MovParsedH264TrackData : public ParsedTrackPrivData
                 // 检查NAL边界是否超出缓冲区
                 if (buff + nalSize > end) {
                     LTRACE(LT_WARN, 2, "Invalid H.264/AVC frame at position " << m_demuxer->getProcessedBytes()
-                                    << " (NAL size exceeds buffer)");
-                    return size; // 返回原始大小，避免解析错误
+                                      << " (NAL size exceeds buffer)");
+                    return size; // 返回原始大小
                 }
                 
                 buff += nalSize;
