@@ -329,27 +329,59 @@ class MovParsedH264TrackData : public ParsedTrackPrivData
         }
     }
 
-    unsigned newBufferSize(uint8_t* buff, const unsigned size) override
+    // 在 movDemuxer.cpp 中修改 MovParsedH264TrackData::newBufferSize 方法
+    unsigned MovParsedH264TrackData::newBufferSize(uint8_t* buff, const unsigned size) override
     {
-        const uint8_t* end = buff + size;
-        unsigned nalCnt = 0;
-        while (buff < end)
-        {
-            if (buff + nal_length_size > end)
-                THROW(ERR_MOV_PARSE,
-                      "MP4/MOV error: Invalid H.264/AVC frame at position " << m_demuxer->getProcessedBytes())
-            const uint32_t nalSize = getNalSize(buff);
-            buff += nal_length_size;
-            if (buff + nalSize > end)
-                THROW(ERR_MOV_PARSE,
-                      "MP4/MOV error: Invalid H.264/AVC frame at position " << m_demuxer->getProcessedBytes())
-            buff += nalSize;
-            ++nalCnt;
+        // 基础检查
+        if (buff == nullptr || size == 0) {
+            LTRACE(LT_WARN, 2, "Empty buffer in H.264 newBufferSize");
+            return 0;
         }
-        unsigned spsPpsSize = 0;
-        for (auto& i : spsPpsList) spsPpsSize += static_cast<uint32_t>(i.size() + 4);
-
-        return size + spsPpsSize + nalCnt * (4 - nal_length_size);
+        
+        try {
+            const uint8_t* end = buff + size;
+            unsigned nalCnt = 0;
+            
+            // 处理缓冲区中的所有NAL单元
+            while (buff < end)
+            {
+                // 确保有足够的字节读取NAL长度
+                if (buff + nal_length_size > end) {
+                    LTRACE(LT_WARN, 2, "Invalid H.264/AVC frame at position " << m_demuxer->getProcessedBytes()
+                                    << " (buffer overrun reading length)");
+                    return size; // 返回原始大小，避免解析错误
+                }
+                
+                // 获取NAL单元大小，添加上限检查
+                const uint32_t nalSize = getNalSize(buff);
+                if (nalSize > 10*1024*1024) { // 10MB是非常大的上限
+                    LTRACE(LT_WARN, 2, "Suspiciously large NAL size: " << nalSize);
+                    return size; // 返回原始大小，避免解析错误
+                }
+                
+                buff += nal_length_size;
+                
+                // 检查NAL边界是否超出缓冲区
+                if (buff + nalSize > end) {
+                    LTRACE(LT_WARN, 2, "Invalid H.264/AVC frame at position " << m_demuxer->getProcessedBytes()
+                                    << " (NAL size exceeds buffer)");
+                    return size; // 返回原始大小，避免解析错误
+                }
+                
+                buff += nalSize;
+                ++nalCnt;
+            }
+            
+            // 计算SPS/PPS大小和输出缓冲区大小
+            unsigned spsPpsSize = 0;
+            for (auto& i : spsPpsList) spsPpsSize += static_cast<uint32_t>(i.size() + 4);
+            
+            return size + spsPpsSize + nalCnt * (4 - nal_length_size);
+        }
+        catch (...) {
+            LTRACE(LT_ERROR, 2, "Exception in H.264 buffer processing at " << m_demuxer->getProcessedBytes());
+            return size; // 安全返回原始大小
+        }
     }
 
    protected:
@@ -362,12 +394,30 @@ class MovParsedH264TrackData : public ParsedTrackPrivData
 
 class MovParsedH265TrackData final : public MovParsedH264TrackData
 {
-   public:
+public:
     MovParsedH265TrackData(MovDemuxer* demuxer, MOVStreamContext* sc) : MovParsedH264TrackData(demuxer, sc) {}
 
     void setPrivData(uint8_t* buff, const int size) override
     {
-        spsPpsList = hevc_extract_priv_data(buff, size, &nal_length_size);
+        // 添加健壮性检查
+        if (buff == nullptr || size <= 0) {
+            LTRACE(LT_WARN, 2, "Invalid buffer in H.265 setPrivData");
+            nal_length_size = 4; // 使用默认值
+            return;
+        }
+        
+        try {
+            spsPpsList = hevc_extract_priv_data(buff, size, &nal_length_size);
+            if (nal_length_size < 1 || nal_length_size > 4) {
+                LTRACE(LT_WARN, 2, "Invalid NAL length size from HEVC extradata: " << (int)nal_length_size);
+                nal_length_size = 4; // 重置为默认值
+            }
+        }
+        catch (...) {
+            LTRACE(LT_ERROR, 2, "Exception in H.265 setPrivData");
+            spsPpsList.clear();
+            nal_length_size = 4; // 使用默认值
+        }
     }
 };
 
