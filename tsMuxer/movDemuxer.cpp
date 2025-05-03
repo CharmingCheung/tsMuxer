@@ -322,35 +322,87 @@ class MovParsedH264TrackData : public ParsedTrackPrivData
         }
     }
 
-    void extractData(AVPacket* pkt, uint8_t* buff, const int size) override
+    void extractData(AVPacket* pkt, uint8_t* buff, const int size)
     {
-        uint8_t* dst = pkt->data;
-        if (!spsPpsList.empty())
-        {
-            for (auto& i : spsPpsList)
-            {
-                *dst++ = 0x0;
-                *dst++ = 0x0;
-                *dst++ = 0x0;
-                *dst++ = 0x1;
-
-                memcpy(dst, i.data(), i.size());
-                dst += i.size();
-            }
-            spsPpsList.clear();
+        // 增加基本检查
+        if (!pkt || !buff || size <= 0) {
+            LTRACE(LT_ERROR, 2, "Invalid parameters in extractData");
+            return;
         }
-        const uint8_t* end = buff + size;
-        while (buff < end)
-        {
-            const uint32_t nalSize = getNalSize(buff);
-            buff += nal_length_size;
-            *dst++ = 0x00;
-            *dst++ = 0x00;
-            *dst++ = 0x00;
-            *dst++ = 0x01;
-            memcpy(dst, buff, nalSize);
-            dst += nalSize;
-            buff += nalSize;
+        
+        try {
+            uint8_t* dst = pkt->data;
+            if (!dst) {
+                LTRACE(LT_ERROR, 2, "Null destination buffer in extractData");
+                return;
+            }
+            
+            // 检查是否需要写入SPS/PPS
+            if (!spsPpsList.empty()) {
+                for (auto& i : spsPpsList) {
+                    // 安全检查：确保目标指针有效且数据大小合理
+                    if (i.size() > 0 && i.size() < 10*1024*1024) { // 10MB上限
+                        *dst++ = 0x0;
+                        *dst++ = 0x0;
+                        *dst++ = 0x0;
+                        *dst++ = 0x1;
+                        
+                        // 使用安全的内存复制，确保不超出缓冲区
+                        size_t copySize = i.size();
+                        if (copySize > 0) {
+                            if (i.data()) {
+                                memcpy(dst, i.data(), copySize);
+                                dst += copySize;
+                            }
+                        }
+                    }
+                }
+                spsPpsList.clear();
+            }
+            
+            // 处理输入缓冲区中的所有NAL单元
+            const uint8_t* end = buff + size;
+            while (buff < end) {
+                // 读取NAL单位大小
+                if (buff + nal_length_size > end) {
+                    LTRACE(LT_WARN, 2, "Buffer overrun while reading NAL length");
+                    break; // 安全退出
+                }
+                
+                const uint32_t nalSize = getNalSize(buff);
+                if (nalSize == 0 || nalSize > 10*1024*1024) { // 10MB是个合理上限
+                    LTRACE(LT_WARN, 2, "Invalid NAL size in extractData: " << nalSize);
+                    break; // 安全退出
+                }
+                
+                buff += nal_length_size;
+                
+                // 确保NAL单元完全包含在缓冲区内
+                if (buff + nalSize > end) {
+                    LTRACE(LT_WARN, 2, "NAL extends beyond buffer bounds");
+                    break; // 安全退出
+                }
+                
+                // 写入NAL开始码
+                *dst++ = 0x00;
+                *dst++ = 0x00;
+                *dst++ = 0x00;
+                *dst++ = 0x01;
+                
+                // 复制NAL数据
+                if (nalSize > 0) {
+                    memcpy(dst, buff, nalSize);
+                    dst += nalSize;
+                }
+                
+                buff += nalSize;
+            }
+        }
+        catch (const std::exception& e) {
+            LTRACE(LT_ERROR, 2, "Exception in extractData: " << e.what());
+        }
+        catch (...) {
+            LTRACE(LT_ERROR, 2, "Unknown exception in extractData");
         }
     }
 
