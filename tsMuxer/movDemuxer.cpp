@@ -331,78 +331,25 @@ class MovParsedH264TrackData : public ParsedTrackPrivData
 
     unsigned newBufferSize(uint8_t* buff, const unsigned size) override
     {
-        // 基本参数检查
-        if (!buff || size == 0) {
-            return 0;
-        }
-    
-        // 检查nal_length_size是否有效
-        if (nal_length_size < 1 || nal_length_size > 4) {
-            // 如果nal_length_size无效，使用默认值4
-            return size * 2;  // 保守估计
-        }
-    
         const uint8_t* end = buff + size;
         unsigned nalCnt = 0;
-        
-        // 安全地迭代缓冲区
-        const uint8_t* current = buff;
-        while (current < end && (end - current) >= nal_length_size)
+        while (buff < end)
         {
-            // 安全地获取NAL大小 - 避免位移导致的问题
-            uint32_t nalSize = 0;
-            if (nal_length_size == 1) {
-                nalSize = current[0];
-            } else if (nal_length_size == 2) {
-                nalSize = ((uint32_t)current[0] << 8) | current[1];
-            } else if (nal_length_size == 3) {
-                nalSize = ((uint32_t)current[0] << 16) | ((uint32_t)current[1] << 8) | current[2];
-            } else { // nal_length_size == 4
-                nalSize = ((uint32_t)current[0] << 24) | ((uint32_t)current[1] << 16) | 
-                          ((uint32_t)current[2] << 8) | current[3];
-            }
-            
-            // 验证NAL大小是否合理
-            if (nalSize == 0 || nalSize > 10*1024*1024) {
-                // NAL大小不合理，可能数据有问题
-                break;
-            }
-            
-            // 确保缓冲区中有足够的数据
-            if (current + nal_length_size + nalSize > end) {
-                break;
-            }
-            
-            // 移动指针
-            current += nal_length_size + nalSize;
-            nalCnt++;
+            if (buff + nal_length_size > end)
+                THROW(ERR_MOV_PARSE,
+                      "MP4/MOV error: Invalid H.264/AVC frame at position " << m_demuxer->getProcessedBytes())
+            const uint32_t nalSize = getNalSize(buff);
+            buff += nal_length_size;
+            if (buff + nalSize > end)
+                THROW(ERR_MOV_PARSE,
+                      "MP4/MOV error: Invalid H.264/AVC frame at position " << m_demuxer->getProcessedBytes())
+            buff += nalSize;
+            ++nalCnt;
         }
-        
-        // 计算SPS/PPS数据大小
         unsigned spsPpsSize = 0;
-        for (const auto& sps : spsPpsList) {
-            // 防止整数溢出
-            if (spsPpsSize <= UINT_MAX - sps.size() - 4) {
-                spsPpsSize += static_cast<unsigned>(sps.size() + 4);
-            } else {
-                // 整数溢出风险，使用保守估计
-                return size * 2;
-            }
-        }
-        
-        // 计算新缓冲区大小，防止除以零和整数溢出
-        unsigned naluOverhead = 0;
-        if (nal_length_size < 4) { // 避免可能的被零除
-            naluOverhead = nalCnt * (4 - nal_length_size);
-        }
-        
-        // 检查整数溢出
-        if (size <= UINT_MAX - spsPpsSize - naluOverhead) {
-            return size + spsPpsSize + naluOverhead;
-        } else {
-            // 返回保守估计
-            return size * 2;
-        }
+        for (auto& i : spsPpsList) spsPpsSize += static_cast<uint32_t>(i.size() + 4);
+
+        return size + spsPpsSize + nalCnt * (4 - nal_length_size);
     }
 
    protected:
