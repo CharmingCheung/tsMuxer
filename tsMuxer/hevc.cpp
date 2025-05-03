@@ -850,36 +850,94 @@ vector<vector<uint8_t>> hevc_extract_priv_data(const uint8_t* buff, int size, ui
     *nal_size = 4;
 
     vector<vector<uint8_t>> spsPps;
-    if (size < 23)
+    // 增强边界检查
+    if (size < 23) {
+        LTRACE(LT_WARN, 2, "HEVC extra data too short, size: " << size);
         return spsPps;
+    }
 
-    *nal_size = (buff[21] & 3) + 1;
-    int num_arrays = buff[22];
+    try {
+        *nal_size = (buff[21] & 3) + 1;
+        if (*nal_size < 1 || *nal_size > 4) {
+            LTRACE(LT_WARN, 2, "Invalid NAL length size: " << static_cast<int>(*nal_size));
+            *nal_size = 4; // 使用默认值
+        }
+        
+        int num_arrays = buff[22];
+        if (num_arrays <= 0 || num_arrays > 64) {
+            LTRACE(LT_WARN, 2, "Suspicious num_arrays value: " << num_arrays);
+            if (num_arrays <= 0) return spsPps;
+            num_arrays = std::min(num_arrays, 64); // 限制为合理值
+        }
 
-    const uint8_t* src = buff + 23;
-    const uint8_t* end = buff + size;
-    for (int i = 0; i < num_arrays; ++i)
-    {
-        if (src + 3 > end)
-            THROW(ERR_MOV_PARSE, "Invalid HEVC extra data format")
-        src++;  // type
-        int cnt = AV_RB16(src);
-        src += 2;
-
-        for (int j = 0; j < cnt; ++j)
-        {
-            if (src + 2 > end)
-                THROW(ERR_MOV_PARSE, "Invalid HEVC extra data format")
-            int nalSize = (src[0] << 8) + src[1];
+        const uint8_t* src = buff + 23;
+        const uint8_t* end = buff + size;
+        
+        for (int i = 0; i < num_arrays; ++i) {
+            // 检查至少有3字节可读（1字节类型 + 2字节计数）
+            if (src + 3 > end) {
+                LTRACE(LT_WARN, 2, "Buffer overrun checking NAL type and count in HEVC params");
+                break;
+            }
+            
+            src++; // 跳过类型字节
+            
+            // 安全读取NAL单元计数
+            int cnt = (src[0] << 8) | src[1];
             src += 2;
-            if (src + nalSize > end)
-                THROW(ERR_MOV_PARSE, "Invalid HEVC extra data format")
-            if (nalSize > 0)
-            {
+            
+            // 合理性检查
+            if (cnt < 0 || cnt > 256) {
+                LTRACE(LT_WARN, 2, "Suspicious NAL count: " << cnt);
+                if (cnt < 0) continue;
+                cnt = std::min(cnt, 256); // 限制为合理值
+            }
+
+            for (int j = 0; j < cnt; ++j) {
+                // 检查至少有2字节可读（NAL大小）
+                if (src + 2 > end) {
+                    LTRACE(LT_WARN, 2, "Buffer overrun reading NAL size in HEVC params");
+                    break;
+                }
+                
+                // 读取NAL大小
+                int nalSize = (src[0] << 8) | src[1];
+                src += 2;
+                
+                // 合理性检查
+                if (nalSize < 0 || nalSize > 1024*1024) {
+                    LTRACE(LT_WARN, 2, "Suspicious NAL size: " << nalSize);
+                    if (nalSize <= 0) {
+                        continue; // 跳过无效大小
+                    }
+                    if (nalSize > 1024*1024) { // 限制为合理的最大值（1MB）
+                        nalSize = end - src; // 使用剩余缓冲区大小
+                    }
+                }
+                
+                // 检查是否有足够的数据
+                if (src + nalSize > end) {
+                    LTRACE(LT_WARN, 2, "NAL size exceeds buffer bounds: " << nalSize);
+                    nalSize = end - src; // 限制为剩余缓冲区大小
+                    if (nalSize <= 0) break;
+                }
+                
+                // 添加到输出
                 spsPps.emplace_back();
-                for (int k = 0; k < nalSize; ++k, ++src) spsPps.rbegin()->push_back(*src);
+                auto& nal = spsPps.back();
+                nal.reserve(nalSize); // 预先分配内存，避免多次重分配
+                
+                for (int k = 0; k < nalSize; ++k) {
+                    nal.push_back(*src++);
+                }
             }
         }
+    }
+    catch (const std::exception& e) {
+        LTRACE(LT_ERROR, 2, "Exception in HEVC param extraction: ");
+    }
+    catch (...) {
+        LTRACE(LT_ERROR, 2, "Unknown exception in HEVC param extraction");
     }
 
     return spsPps;
